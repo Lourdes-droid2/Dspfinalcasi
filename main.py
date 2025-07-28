@@ -1,165 +1,96 @@
 import os
 import numpy as np
-import soundfile as sf
+from scipy.io import wavfile
+from simulation import SimuladorDOA, crear_senal_prueba
+from tdoa import EstimadorTDOA
+from doa import EstimadorDOA
+from evaluacion import EvaluadorDOA
+
+print("=== SIMULADOR DOA CON RUIDO AMBIENTE - PRUEBA ===")
+
+# Parámetros de ambiente
+ambiente_tipo = input("   Tipo de ambiente (1=Anecoico, 2=Reverberante) [default: 2]: ") or "2"
+sim = SimuladorDOA(fs=16000)
+
+if ambiente_tipo == "1":
+    sim.simular_ambiente_anecoico(
+        room_size=[float(input("   Ancho del recinto (X) en metros [default: 6.0]: ") or 6.0), 
+                    float(input("   Largo del recinto (Y) en metros [default: 4.0]: ") or 4.0),
+                    float(input("   Altura del recinto (Z) en metros [default: 3.0]: ") or 3.0)],
+                    max_order = 0,
+                    absorption = float(input("Ingrese el coeficiente de absorción de la sala (default 1): ") or 1),
+                    air_absorption=False
+    )
+else:
+    sim.simular_ambiente_reverberante(
+        room_size=[float(input("   Ancho del recinto (X) en metros [default: 6.0]: ") or 6.0), 
+                    float(input("   Largo del recinto (Y) en metros [default: 4.0]: ") or 4.0),
+                    float(input("   Altura del recinto (Z) en metros [default: 3.0]: ") or 3.0)], 
+        rt60= float(input("   RT60 en segundos [default: 0.3]: ") or 0.3),
+    )
+
+# Cargar señal WAV
+wav_path = input("Ingrese la ruta completa del archivo WAV para cargar (ejemplo: simulaciones/p227_004.wav): ")
+while not wav_path or not os.path.isfile(wav_path):
+    print("Ruta inválida o archivo no encontrado. Por favor, ingrese una ruta válida.")
+    wav_path = input("Ingrese la ruta completa del archivo WAV para cargar (ejemplo: simulaciones/p227_004.wav): ")
+
+fs_loaded, signal = wavfile.read(wav_path)
+signal = signal.astype(np.float32) / 32767.0
+
+if fs_loaded != sim.fs:
+    print(f"Advertencia: La frecuencia de muestreo cargada ({fs_loaded}) es diferente de la configurada ({sim.fs}). Se actualizará.")
+    sim.fs = fs_loaded
+
+# Configuración de fuente
+azimuth_real = float(input(f"     Azimuth en grados [default: 60]: ") or 60.0)
+distancia_real = float(input("     Distancia en metros [default: 2.0]: ") or 2.0)
+while distancia_real < 2.0:
+    print("Se debe mantener la condición de campo lejano con una distancia mayor a 2 metros.")
+    distancia_real = float(input("Ingrese una distancia en metros mayor a 2.0: ") or 2.0)
+elevacion_real = float(input("     Elevación en grados [default: 0.0]: ") or 0.0)
+
+sim.agregar_fuente(signal, azimuth=azimuth_real, distance=distancia_real, elevation=elevacion_real)
+sim.simular_propagacion(agregar_ruido=True, snr_db=20)
+
+# TDOA
+estimador_tdoa = EstimadorTDOA(fs=sim.fs)
+mic_signals = sim.signals['mic_signals']
+num_mics = mic_signals.shape[0]
+
+pares_microfonos = [(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)]
+resultados_tdoa = {}
+for i, j in pares_microfonos:
+    resultado = estimador_tdoa.estimar_tdoa_par(mic_signals[i], mic_signals[j], metodo="gcc_phat")
+    key = f"mic_{i+1}_mic_{j+1}"
+    resultados_tdoa[key] = resultado
+
+# DOA
+estimador_doa = EstimadorDOA(c=343.0)
+spacing = sim.array_geometry['spacing']
+array_positions = sim.array_geometry['positions']
+resultados_doa = estimador_doa.calcular_angulo_arribo(resultados_tdoa, spacing, geometria='linear')
+
+# Promediado de ángulos
+resultado_promedio = estimador_doa.promediar_angulos(resultados_doa, metodo='circular')
+
+# Exportar resultados a CSV
 import pandas as pd
-from scipy.signal import fftconvolve
+df_resultados = pd.DataFrame([
+    {
+        'mic_pair': k,
+        'tdoa_seconds': v['tdoa_seconds'],
+        'doa_deg': resultados_doa[k]['angulo_deg'] if resultados_doa[k]['valido'] else None,
+        'confidence': v['confidence']
+    }
+    for k, v in resultados_tdoa.items()
+])
+df_resultados.to_csv("resultados_doa_tdoa.csv", index=False)
+print("Resultados exportados a resultados_doa_tdoa.csv")
 
-from load_signal import load_signal_from_wav
-from tdoa import estimate_tdoa_cc, estimate_tdoa_gcc
-from doa import estimate_doa_from_tdoa
+# Visualización
+estimador_doa.visualizar_estimaciones(resultados_doa, angulo_real=azimuth_real)
 
-# --- Configuración ---
-RIR_DATASET_DIR = "rir_dataset_user_defined"
-METADATA_FILENAME = os.path.join(RIR_DATASET_DIR, "simulation_metadata.csv")
-ANECHOIC_SIGNAL_PATH = "p336_007.wav"
-SNRS_TO_TEST_DB = [90]
-C_SOUND = 343.0
-
-def calculate_real_tdoa(source_pos, mic_a_pos, mic_b_pos, c=C_SOUND):
-    dist_a = np.linalg.norm(np.array(source_pos) - np.array(mic_a_pos))
-    dist_b = np.linalg.norm(np.array(source_pos) - np.array(mic_b_pos))
-    return (dist_a - dist_b) / c
-
-def add_noise_for_snr(signal, target_snr_db):
-    signal_power = np.mean(signal**2)
-    if signal_power == 0:
-        return signal
-    snr_linear = 10**(target_snr_db / 10.0)
-    noise_power = signal_power / snr_linear
-    noise = np.random.normal(0, 1, len(signal))
-    noise = noise * np.sqrt(noise_power / (np.mean(noise**2) + 1e-12))
-    return signal + noise
-
-def process_simulation_data():
-    print("--- main.py: Iniciando procesamiento de datos de simulación ---")
-    if not os.path.exists(METADATA_FILENAME):
-        print(f"Error: Archivo de metadatos no encontrado: {METADATA_FILENAME}")
-        return
-
-    metadata_df = pd.read_csv(METADATA_FILENAME, engine='python')
-    print(f"Metadatos cargados: {len(metadata_df)} configuraciones encontradas en CSV.")
-
-    anechoic_signal, fs_anechoic = load_signal_from_wav(ANECHOIC_SIGNAL_PATH, target_fs=44100, normalize=True)
-    if anechoic_signal is None:
-        print(f"Error: No se pudo cargar la señal anecoica de {ANECHOIC_SIGNAL_PATH}")
-        return
-    print(f"Señal anecoica cargada: {ANECHOIC_SIGNAL_PATH} (Fs: {fs_anechoic} Hz)")
-
-    all_experiment_results = []
-    tdoa_methods = ['cc', 'phat', 'scot', 'ml', 'roth']
-    print(f"Métodos TDOA a probar: {tdoa_methods}")
-
-    for idx, sim_params in metadata_df.iterrows():
-        print(f"\nProcesando Config ID: {sim_params['config_id']} ({idx+1}/{len(metadata_df)})")
-        fs_sim = sim_params['fs_hz']
-        if fs_sim != fs_anechoic:
-            print(f"  Advertencia: Fs de simulación ({fs_sim}) no coincide con Fs anecoica ({fs_anechoic}). Saltando config.")
-            continue
-
-        num_mics = int(sim_params['num_mics_processed'])
-        mic_rirs, mic_positions = [], []
-        valid = True
-
-        for i in range(num_mics):
-            rir_path = os.path.join(RIR_DATASET_DIR, f"{sim_params['rir_file_basename']}_micidx_{i}.wav")
-            if not os.path.exists(rir_path):
-                print(f"  Error: RIR no encontrada: {rir_path}. Saltando config.")
-                valid = False
-                break
-            try:
-                rir_data, _ = sf.read(rir_path)
-                mic_rirs.append(rir_data)
-                pos = [sim_params.get(f'mic{i}_pos_x', np.nan),
-                       sim_params.get(f'mic{i}_pos_y', np.nan),
-                       sim_params.get(f'mic{i}_pos_z', np.nan)]
-                if any(pd.isna(pos)):
-                    print(f"  Advertencia: Posición incompleta para micrófono {i}. Saltando config.")
-                    valid = False
-                    break
-                mic_positions.append(pos)
-            except Exception as e:
-                print(f"  Error cargando RIR {rir_path}: {e}. Saltando config.")
-                valid = False
-                break
-
-        if not valid or len(mic_rirs) != num_mics:
-            continue
-
-        reverberant_signals = [fftconvolve(anechoic_signal, rir, mode='full') for rir in mic_rirs]
-        source_pos = [sim_params['source_pos_x'], sim_params['source_pos_y'], sim_params['source_pos_z']]
-        real_doa_deg = sim_params.get('actual_azimuth_src_to_array_center_deg', np.nan)
-        mic_sep = sim_params['mic_separation_m']
-
-        for snr_db in SNRS_TO_TEST_DB:
-            noisy_signals = [add_noise_for_snr(sig, snr_db) for sig in reverberant_signals]
-            mic_pairs = []
-            for i in range(num_mics):
-                for j in range(i + 1, num_mics):
-                    d_pair = abs(j - i) * mic_sep
-                    real_tdoa = calculate_real_tdoa(source_pos, mic_positions[i], mic_positions[j])
-                    mic_pairs.append({'mic1': i, 'mic2': j, 'd': d_pair, 'real_tdoa': real_tdoa})
-
-            pair_results_by_method = {}
-            for pair in mic_pairs:
-                idx1, idx2, d_pair, real_tdoa = pair['mic1'], pair['mic2'], pair['d'], pair['real_tdoa']
-                sig_a, sig_b = noisy_signals[idx1], noisy_signals[idx2]
-                for method in tdoa_methods:
-                    try:
-                        if method == 'cc':
-                            tdoa_val, comp_time = estimate_tdoa_cc(sig_a, sig_b, fs_sim)
-                        else:
-                            tdoa_val, comp_time = estimate_tdoa_gcc(sig_a, sig_b, fs_sim, method=method)
-                        doa_est = estimate_doa_from_tdoa(tdoa_val, d_pair) if not np.isnan(tdoa_val) else np.nan
-                    except Exception as e:
-                        print(f"  Error en método {method} para par {idx1}-{idx2}: {e}")
-                        tdoa_val, doa_est = np.nan, np.nan
-                    if method not in pair_results_by_method:
-                        pair_results_by_method[method] = []
-                    pair_results_by_method[method].append({
-                        'doa_estimated_from_pair_deg': doa_est,
-                        'mic_pair': f"{idx1}-{idx2}",
-                        'tdoa_val': tdoa_val,
-                        'd_pair': d_pair,
-                        'real_tdoa': real_tdoa,
-                        'doa_real_deg': real_doa_deg,
-                    })
-
-            for method in tdoa_methods:
-                adj_pairs = [r for r in pair_results_by_method.get(method, []) if abs(int(r['mic_pair'].split('-')[0]) - int(r['mic_pair'].split('-')[1])) == 1]
-                doa_vals = [r['doa_estimated_from_pair_deg'] for r in adj_pairs]
-                doa_array_est = np.nanmean(doa_vals) if any(~np.isnan(doa_vals)) else np.nan
-                doa_array_error = doa_array_est - real_doa_deg if not np.isnan(doa_array_est) and not np.isnan(real_doa_deg) else np.nan
-                result = sim_params.to_dict()
-                result.update({
-                    'snr_db': snr_db,
-                    'mic_pair': 'array_avg_adj_pairs',
-                    'tdoa_method_for_avg_doa': method,
-                    'doa_array_estimated_deg': doa_array_est,
-                    'doa_array_real_deg': real_doa_deg,
-                    'doa_array_error_deg': doa_array_error
-                })
-                all_experiment_results.append(result)
-
-            for method in tdoa_methods:
-                for pair_result in pair_results_by_method.get(method, []):
-                    pair_result_full = sim_params.to_dict()
-                    pair_result_full.update(pair_result)
-                    pair_result_full['snr_db'] = snr_db
-                    pair_result_full['tdoa_method'] = method
-                    all_experiment_results.append(pair_result_full)
-
-    if all_experiment_results:
-        results_df = pd.DataFrame(all_experiment_results)
-        avg_results = results_df[results_df['mic_pair'] == 'array_avg_adj_pairs']
-        avg_results.to_csv("doa_array_avg_results.csv", index=False)
-        print("Resultados promediados por array guardados en: doa_array_avg_results.csv")
-    else:
-        print("No se generaron resultados.")
-    print("--- main.py: Procesamiento finalizado ---")
-
-if __name__ == "__main__":
-    if not os.path.exists(ANECHOIC_SIGNAL_PATH):
-        raise ValueError(f"Archivo anecoico {ANECHOIC_SIGNAL_PATH} no encontrado. Por favor, asegúrate de que el archivo existe en el directorio actual.")
-    if not os.path.exists(METADATA_FILENAME):
-        raise ValueError(f"Archivo de metadatos {METADATA_FILENAME} no encontrado. Por favor, asegúrate de que el archivo existe en el directorio {RIR_DATASET_DIR}.")
-    process_simulation_data()
+# Reporte
+reporte = estimador_doa.generar_reporte(resultados_doa, resultado_promedio, angulo_real=azimuth_real)
+print(reporte)
