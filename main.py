@@ -5,6 +5,7 @@ from simulation import SimuladorDOA, crear_senal_prueba
 from tdoa import EstimadorTDOA
 from doa import EstimadorDOA
 from evaluacion import EvaluadorDOA
+import pandas as pd
 
 print("=== SIMULADOR DOA CON RUIDO AMBIENTE - PRUEBA ===")
 
@@ -60,8 +61,9 @@ num_mics = mic_signals.shape[0]
 
 pares_microfonos = [(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)]
 resultados_tdoa = {}
+metodo_tdoa = "gcc_phat"  # O el método que estés usando en la simulación
 for i, j in pares_microfonos:
-    resultado = estimador_tdoa.estimar_tdoa_par(mic_signals[i], mic_signals[j], metodo="gcc_phat")
+    resultado = estimador_tdoa.estimar_tdoa_par(mic_signals[i], mic_signals[j], metodo=metodo_tdoa)
     key = f"mic_{i+1}_mic_{j+1}"
     resultados_tdoa[key] = resultado
 
@@ -75,7 +77,6 @@ resultados_doa = estimador_doa.calcular_angulo_arribo(resultados_tdoa, spacing, 
 resultado_promedio = estimador_doa.promediar_angulos(resultados_doa, metodo='circular')
 
 # Exportar resultados a CSV
-import pandas as pd
 df_resultados = pd.DataFrame([
     {
         'mic_pair': k,
@@ -94,3 +95,29 @@ estimador_doa.visualizar_estimaciones(resultados_doa, angulo_real=azimuth_real)
 # Reporte
 reporte = estimador_doa.generar_reporte(resultados_doa, resultado_promedio, angulo_real=azimuth_real)
 print(reporte)
+
+df_resultado = pd.DataFrame([{
+    'ambiente': ambiente_tipo,
+    'num_mics': num_mics,
+    'spacing': spacing,
+    'distance': distancia_real,
+    'elevation': elevacion_real,
+    'fs': sim.fs,
+    'rt60': rt60 if ambiente_tipo == "2" else None,
+    'metodo_tdoa': metodo_tdoa,
+    'error_promedio': abs(resultado_promedio['angulo_promedio_deg'] - azimuth_real) if resultado_promedio['valido'] else None
+}])
+
+output_dir = "resultados_csv"
+os.makedirs(output_dir, exist_ok=True)
+
+nombre_experimento = input("Ingrese nombre del experimento (ej: num_mics, spacing, distance, elevation, fs, rt60, metodo_tdoa): ")
+csv_path = os.path.join(output_dir, f"resultados_{nombre_experimento}.csv")
+
+if os.path.isfile(csv_path):
+    df_existente = pd.read_csv(csv_path)
+    df_final = pd.concat([df_existente, df_resultado], ignore_index=True)
+else:
+    df_final = df_resultado
+df_final.to_csv(csv_path, index=False)
+print(f"Resultado guardado en {csv_path}")
