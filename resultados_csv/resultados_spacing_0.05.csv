@@ -1,0 +1,2 @@
+ambiente,num_mics,spacing,distance,elevation,fs,rt60,metodo_tdoa,error_promedio
+1,4,0.05,2.0,0.0,48000,,gcc_phat,1.4555276796394878
